@@ -1,88 +1,131 @@
 const express = require('express');
+const { WebSocketServer } = require('ws');
+const path = require('path');
 const http = require('http');
-const WebSocket = require('ws');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocketServer({ server });
 
-// Serve static files from the 'public' directory
-app.use(express.static('public'));
+// Serve static files from the public directory
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Game logic
-const choices = ['rock', 'paper', 'scissors'];
-
-function determineWinner(choice1, choice2) {
-  if (choice1 === choice2) return 'draw';
-  if (
-    (choice1 === 'rock' && choice2 === 'scissors') ||
-    (choice1 === 'scissors' && choice2 === 'paper') ||
-    (choice1 === 'paper' && choice2 === 'rock')
-  ) {
-    return 'player1';
-  }
-  return 'player2';
-}
-
-let players = [];
-let waitingPlayer = null;
+// Store connected players
+const waitingPlayers = new Set();
+const playerSockets = new Map();
+const playerMatches = new Map();
 
 wss.on('connection', (ws) => {
-  ws.on('message', (message) => {
-    const data = JSON.parse(message);
+    ws.on('message', (message) => {
+        const data = JSON.parse(message);
 
-    if (data.type === 'login') {
-      if (waitingPlayer) {
-        // Start the game with the waiting player
-        const opponent = waitingPlayer;
-        waitingPlayer = null;
+        if (data.type === 'login') {
+            handleLogin(ws, data.username);
+        } else if (data.type === 'play') {
+            handlePlay(ws, data.username, data.choice);
+        }
+    });
 
-        const player1 = { ws, username: data.username };
-        const player2 = { ws: opponent.ws, username: opponent.username };
-
-        player1.ws.send(JSON.stringify({ type: 'start', opponent: player2.username }));
-        player2.ws.send(JSON.stringify({ type: 'start', opponent: player1.username }));
-
-        players.push(player1, player2);
-      } else {
-        // Set this player as waiting
-        waitingPlayer = { ws, username: data.username };
-      }
-    } else if (data.type === 'play') {
-      const playerIndex = players.findIndex(p => p.ws === ws);
-      const opponentIndex = playerIndex === 0 ? 1 : 0;
-
-      ws.choice = data.choice; // Store the player's choice
-
-      if (players[opponentIndex] && players[opponentIndex].choice) {
-        const opponentChoice = players[opponentIndex].choice;
-        const result = determineWinner(data.choice, opponentChoice);
-
-        const playerMessage = result === 'draw' ? 'Draw!' : result === 'player1' ? 'You win!' : 'You lose!';
-        const opponentMessage = result === 'draw' ? 'Draw!' : result === 'player2' ? 'You win!' : 'You lose!';
-
-        ws.send(JSON.stringify({ type: 'result', result: playerMessage }));
-        players[opponentIndex].ws.send(JSON.stringify({ type: 'result', result: opponentMessage }));
-
-        // Reset choices
-        players[playerIndex].choice = null;
-        players[opponentIndex].choice = null;
-      } else {
-        players[playerIndex].choice = data.choice; // Store the choice for later
-      }
-    }
-  });
-
-  ws.on('close', () => {
-    players = players.filter(player => player.ws !== ws);
-    if (waitingPlayer && waitingPlayer.ws === ws) {
-      waitingPlayer = null;
-    }
-  });
-
-  ws.send('Welcome to Rock-Paper-Scissors!');
+    ws.on('close', () => {
+        handleDisconnect(ws);
+    });
 });
 
-server.listen(8080, () => {
-  console.log('Server is listening on port 8080');
+function handleLogin(ws, username) {
+    // Store the player's socket
+    playerSockets.set(username, ws);
+
+    if (waitingPlayers.size > 0) {
+        // Get the first waiting player
+        const opponent = Array.from(waitingPlayers)[0];
+        waitingPlayers.delete(opponent);
+
+        // Create a match
+        playerMatches.set(username, opponent);
+        playerMatches.set(opponent, username);
+
+        // Notify both players
+        const opponentSocket = playerSockets.get(opponent);
+        ws.send(JSON.stringify({ type: 'start', opponent }));
+        opponentSocket.send(JSON.stringify({ type: 'start', opponent: username }));
+    } else {
+        // Add player to waiting list
+        waitingPlayers.add(username);
+    }
+}
+
+function handlePlay(ws, username, choice) {
+    const opponent = playerMatches.get(username);
+    if (!opponent) return;
+
+    const opponentSocket = playerSockets.get(opponent);
+    if (!opponentSocket) return;
+
+    // Store the player's choice
+    ws.choice = choice;
+    
+    // Check if both players have made their choices
+    if (opponentSocket.choice) {
+        const result = determineWinner(choice, opponentSocket.choice);
+        ws.send(JSON.stringify({ type: 'result', result: result.player1 }));
+        opponentSocket.send(JSON.stringify({ type: 'result', result: result.player2 }));
+        
+        // Reset choices
+        ws.choice = null;
+        opponentSocket.choice = null;
+    }
+}
+
+function determineWinner(choice1, choice2) {
+    if (choice1 === choice2) {
+        return { player1: 'Draw!', player2: 'Draw!' };
+    }
+
+    const wins = {
+        rock: 'scissors',
+        paper: 'rock',
+        scissors: 'paper'
+    };
+
+    if (wins[choice1] === choice2) {
+        return { 
+            player1: 'You win! ' + choice1 + ' beats ' + choice2,
+            player2: 'You lose! ' + choice1 + ' beats ' + choice2
+        };
+    } else {
+        return {
+            player1: 'You lose! ' + choice2 + ' beats ' + choice1,
+            player2: 'You win! ' + choice2 + ' beats ' + choice1
+        };
+    }
+}
+
+function handleDisconnect(ws) {
+    // Find and remove the disconnected player
+    for (const [username, socket] of playerSockets.entries()) {
+        if (socket === ws) {
+            playerSockets.delete(username);
+            waitingPlayers.delete(username);
+            
+            // Notify opponent if in a match
+            const opponent = playerMatches.get(username);
+            if (opponent) {
+                const opponentSocket = playerSockets.get(opponent);
+                if (opponentSocket) {
+                    opponentSocket.send(JSON.stringify({
+                        type: 'result',
+                        result: 'Opponent disconnected!'
+                    }));
+                }
+                playerMatches.delete(username);
+                playerMatches.delete(opponent);
+            }
+            break;
+        }
+    }
+}
+
+const port = process.env.PORT || 8080;
+server.listen(port, () => {
+    console.log(`Server running on port ${port}`);
 }); 
